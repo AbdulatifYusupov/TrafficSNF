@@ -6,20 +6,16 @@
 
 #include <memory>
 
-#include "core/packet_types.h"
-
 namespace Ui { class MainWindow; }
 class QLabel;
+class PacketTableModel;
 class SnifferWorker;
 
 /**
- * Main window. Owns the capture thread and the (per-session) worker, and
- * renders incoming packet batches into a temporary QTableWidget.
- *
- * Lifetime rules (all on the GUI thread):
- *   - A fresh SnifferWorker is created on every Start and deleted in
- *     joinAndDeleteWorker() after the thread has been joined.
- *   - The QThread object itself is a member and is reused between sessions.
+ * Main window. Owns the capture thread, the per-session worker and the packet
+ * model. Packets flow worker -> model directly (queued connection); the
+ * window only reacts to the model's row-insertion signals for auto-scroll and
+ * the status bar.
  */
 class MainWindow : public QMainWindow
 {
@@ -38,14 +34,18 @@ private slots:
 
     // Worker -> GUI (queued connections)
     void onCaptureStarted(int linkType);
-    void onPacketsReady(const PacketBatch& batch);
     void onCaptureError(const QString& message);
     void onCaptureStatistics(quint32 received, quint32 dropped);
     void onCaptureFinished();
 
+    // Model -> GUI
+    void onRowsAboutToBeInserted();
+    void onRowsInserted();
+
 private:
     enum class State { Idle, Running, Stopping };
 
+    void setupPacketView();
     void populateInterfaces();
     void setState(State state);
     void updateStatusLabels();
@@ -54,17 +54,18 @@ private:
 
     std::unique_ptr<Ui::MainWindow> ui;
 
+    PacketTableModel* m_model = nullptr;   // owned by this (QObject parent)
+
     QThread        m_thread;
     SnifferWorker* m_worker = nullptr;
     State          m_state  = State::Idle;
 
-    // Status bar widgets (owned by the status bar).
     QLabel* m_labelInterface = nullptr;
     QLabel* m_labelCount     = nullptr;
 
-    // Per-session display state.
     QString m_currentInterface;
-    quint64 m_totalPackets     = 0;
-    qint64  m_firstTimestampUs = -1;   ///< Reference for the relative "Time" column.
     QString m_lastStatsText;
+
+    /// Decided just before each insertion: should the view follow the tail?
+    bool m_followTail = true;
 };

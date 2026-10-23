@@ -1,27 +1,18 @@
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
 
+#include "core/packet_table_model.h"
 #include "core/sniffer_worker.h"
 
 #include <QCloseEvent>
 #include <QHeaderView>
+#include <QItemSelectionModel>
 #include <QLabel>
 #include <QMessageBox>
 #include <QScrollBar>
+#include <QShortcut>
 #include <QStatusBar>
-#include <QTableWidgetItem>
-
-namespace {
-
-/// Table cell factory: read-only, right-aligned numeric text.
-QTableWidgetItem* makeNumericItem(const QString& text)
-{
-    auto* item = new QTableWidgetItem(text);
-    item->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
-    return item;
-}
-
-} // namespace
+#include <QTableView>
 
 // ---------------------------------------------------------------------------
 // Construction / destruction
@@ -32,17 +23,8 @@ MainWindow::MainWindow(QWidget* parent)
 {
     ui->setupUi(this);
 
-    // --- Packet table (temporary placeholder for a QAbstractTableModel) ---
-    QTableWidget* table = ui->tablePackets;
-    table->setColumnCount(3);
-    table->setHorizontalHeaderLabels({tr("No."), tr("Time"), tr("Length")});
-    table->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    table->setSelectionBehavior(QAbstractItemView::SelectRows);
-    table->setAlternatingRowColors(true);
-    table->verticalHeader()->hide();
-    table->horizontalHeader()->setStretchLastSection(true);
-    table->setColumnWidth(0, 80);
-    table->setColumnWidth(1, 120);
+    m_model = new PacketTableModel(this);
+    setupPacketView();
 
     // --- Status bar: two permanent labels (interface, packet count) ---
     m_labelInterface = new QLabel(this);
@@ -53,6 +35,22 @@ MainWindow::MainWindow(QWidget* parent)
     connect(ui->btnStart, &QPushButton::clicked, this, &MainWindow::onStartClicked);
     connect(ui->btnStop,  &QPushButton::clicked, this, &MainWindow::onStopClicked);
 
+    // Auto-scroll bookkeeping: decide BEFORE the rows arrive (scrollbar still
+    // reflects what the user is looking at), act AFTER the view has relaid out.
+    connect(m_model, &QAbstractItemModel::rowsAboutToBeInserted,
+            this, &MainWindow::onRowsAboutToBeInserted);
+    connect(m_model, &QAbstractItemModel::rowsInserted,
+            this, &MainWindow::onRowsInserted);
+    connect(m_model, &QAbstractItemModel::modelReset,
+            this, &MainWindow::updateStatusLabels);
+
+    // Ctrl+End: deselect and jump to the newest packet, which resumes auto-scroll.
+    auto* followShortcut = new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_End), this);
+    connect(followShortcut, &QShortcut::activated, this, [this] {
+        ui->tablePackets->clearSelection();
+        ui->tablePackets->scrollToBottom();
+    });
+
     populateInterfaces();
     setState(State::Idle);
     updateStatusLabels();
@@ -60,14 +58,56 @@ MainWindow::MainWindow(QWidget* parent)
 
 MainWindow::~MainWindow()
 {
-    // Normally closeEvent() has already done this; it's idempotent.
-    shutdownCapture();
+    shutdownCapture();   // idempotent; closeEvent normally did it already
 }
 
 void MainWindow::closeEvent(QCloseEvent* event)
 {
-    shutdownCapture();   // never leave a running QThread behind
+    shutdownCapture();
     QMainWindow::closeEvent(event);
+}
+
+// ---------------------------------------------------------------------------
+// Packet view configuration
+// ---------------------------------------------------------------------------
+void MainWindow::setupPacketView()
+{
+    QTableView* view = ui->tablePackets;
+    view->setModel(m_model);
+
+    view->setSelectionBehavior(QAbstractItemView::SelectRows);
+    view->setSelectionMode(QAbstractItemView::SingleSelection);
+    view->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    view->setAlternatingRowColors(true);
+    view->setShowGrid(false);
+    view->setWordWrap(false);
+    view->setTextElideMode(Qt::ElideRight);
+
+    // Fixed row height is the single biggest QTableView performance lever:
+    // the view never has to measure rows (ResizeToContents is O(rows)).
+    QHeaderView* vh = view->verticalHeader();
+    vh->hide();
+    vh->setSectionResizeMode(QHeaderView::Fixed);
+    vh->setDefaultSectionSize(fontMetrics().height() + 6);
+
+    QHeaderView* hh = view->horizontalHeader();
+    hh->setHighlightSections(false);
+    hh->setStretchLastSection(true);          // Info takes the remaining width
+    hh->setSectionResizeMode(QHeaderView::Interactive);
+
+    view->setColumnWidth(PacketTableModel::ColNo,          70);
+    view->setColumnWidth(PacketTableModel::ColTime,        110);
+    view->setColumnWidth(PacketTableModel::ColSource,      230);
+    view->setColumnWidth(PacketTableModel::ColDestination, 230);
+    view->setColumnWidth(PacketTableModel::ColProtocol,    90);
+    view->setColumnWidth(PacketTableModel::ColLength,      70);
+
+    // Header sorting. The indicator is set to "No. ascending" (the natural
+    // arrival order) BEFORE enabling sorting, so the view's initial sort is a
+    // no-op instead of some arbitrary default. Clicks are only enabled while
+    // idle, see setState().
+    hh->setSortIndicator(PacketTableModel::ColNo, Qt::AscendingOrder);
+    view->setSortingEnabled(true);
 }
 
 // ---------------------------------------------------------------------------
@@ -82,14 +122,13 @@ void MainWindow::populateInterfaces()
     for (const NetworkDevice& dev : devices) {
         QString label = dev.name;
         if (!dev.description.isEmpty())
-            label += QStringLiteral(" \u2014 ") + dev.description;
-        // Display text is friendly; the raw pcap device name rides along as item data.
+            label = dev.description + QStringLiteral("  (") + dev.name + QLatin1Char(')');
         ui->comboInterfaces->addItem(label, dev.name);
     }
 
     if (devices.isEmpty()) {
         statusBar()->showMessage(error.isEmpty()
-                                 ? tr("No capture devices found (do you have the required privileges?)")
+                                 ? tr("No capture devices found (is Npcap installed / do you have privileges?)")
                                  : tr("Cannot list devices: %1").arg(error));
     }
 }
@@ -104,14 +143,18 @@ void MainWindow::setState(State state)
 
     ui->comboInterfaces->setEnabled(state == State::Idle && haveDevices);
     ui->btnStart->setEnabled(state == State::Idle && haveDevices);
-    ui->btnStop->setEnabled(state == State::Running);   // disabled while Stopping
+    ui->btnStop->setEnabled(state == State::Running);
+
+    // Re-sorting reorders the entire store, which makes no sense while rows
+    // are still being appended, so header clicks only work when stopped.
+    ui->tablePackets->horizontalHeader()->setSectionsClickable(state == State::Idle);
 }
 
 void MainWindow::updateStatusLabels()
 {
     m_labelInterface->setText(tr("Interface: %1")
                                   .arg(m_currentInterface.isEmpty() ? QStringLiteral("\u2014") : m_currentInterface));
-    m_labelCount->setText(tr("Packets: %1").arg(m_totalPackets));
+    m_labelCount->setText(tr("Packets: %1").arg(m_model->packetCount()));
 }
 
 // ---------------------------------------------------------------------------
@@ -124,33 +167,35 @@ void MainWindow::onStartClicked()
 
     const QString device = ui->comboInterfaces->currentData().toString();
 
-    // Reset per-session state.
-    ui->tablePackets->setRowCount(0);
-    m_totalPackets     = 0;
-    m_firstTimestampUs = -1;
+    // Fresh session: empty model first, then put the sort indicator back on
+    // "No. ascending" (the model is empty, so the resulting sort is free).
+    m_model->clear();
+    ui->tablePackets->horizontalHeader()->setSortIndicator(PacketTableModel::ColNo,
+                                                           Qt::AscendingOrder);
+    m_followTail = true;
     m_lastStatsText.clear();
     m_currentInterface = device;
 
-    // Worker-object pattern: no parent, then moveToThread.
-    m_worker = new SnifferWorker(device);
+    m_worker = new SnifferWorker(device);   // no parent: it will move threads
     m_worker->moveToThread(&m_thread);
 
-    // Must be QUEUED: if run() were invoked directly from inside the
-    // started() emission it would execute before QThread enters exec(), and
-    // a quit() issued afterwards would be silently lost (exec() resets the
-    // exit flag on entry), hanging the join.
+    // QUEUED on purpose: run() must execute from inside the thread's event
+    // loop, otherwise a quit() issued before exec() is entered gets lost.
     connect(&m_thread, &QThread::started, m_worker, &SnifferWorker::run, Qt::QueuedConnection);
 
-    // Worker -> GUI. Worker emits from its own thread => automatically queued.
+    // Worker -> model. The worker emits from its own thread and the model
+    // lives here, so this is queued: batches are marshalled through the GUI
+    // event loop, with no locks and no blocking of the capture thread.
+    connect(m_worker, &SnifferWorker::packetsReady,
+            m_model, &PacketTableModel::appendPackets, Qt::QueuedConnection);
+
     connect(m_worker, &SnifferWorker::captureStarted,    this, &MainWindow::onCaptureStarted);
-    connect(m_worker, &SnifferWorker::packetsReady,      this, &MainWindow::onPacketsReady);
     connect(m_worker, &SnifferWorker::captureError,      this, &MainWindow::onCaptureError);
     connect(m_worker, &SnifferWorker::captureStatistics, this, &MainWindow::onCaptureStatistics);
     connect(m_worker, &SnifferWorker::finished,          this, &MainWindow::onCaptureFinished);
 
-    // Direct on purpose: QThread::quit() is thread-safe, and calling it from
-    // the worker thread means the thread winds down even if the GUI thread is
-    // blocked in QThread::wait() (see closeEvent).
+    // Direct: QThread::quit() is thread-safe, and calling it from the worker
+    // thread lets the thread wind down even if the GUI thread is blocked in wait().
     connect(m_worker, &SnifferWorker::finished, &m_thread, &QThread::quit, Qt::DirectConnection);
 
     setState(State::Running);
@@ -165,9 +210,6 @@ void MainWindow::onStopClicked()
     if (m_state != State::Running || !m_worker)
         return;
 
-    // Stopping can take up to the pcap read timeout (1 s) on platforms where
-    // pcap_breakloop() doesn't interrupt a blocked read, so give feedback and
-    // lock the controls until finished() arrives.
     setState(State::Stopping);
     statusBar()->showMessage(tr("Stopping capture\u2026"));
     m_worker->requestStop();
@@ -182,63 +224,14 @@ void MainWindow::onCaptureStarted(int linkType)
                                  .arg(m_currentInterface).arg(linkType));
 }
 
-void MainWindow::onPacketsReady(const PacketBatch& batch)
-{
-    if (batch.isEmpty())
-        return;
-
-    QTableWidget* table = ui->tablePackets;
-
-    // Only auto-scroll if the user is already looking at the bottom, so
-    // scrolling up to inspect something isn't fought by new rows.
-    QScrollBar* vbar = table->verticalScrollBar();
-    const bool followTail = vbar->value() >= vbar->maximum() - 2;
-
-    // One layout/paint pass per batch instead of per row.
-    table->setUpdatesEnabled(false);
-
-    int row = table->rowCount();
-    table->setRowCount(row + static_cast<int>(batch.size()));
-
-    for (const RawPacket& pkt : batch) {
-        if (m_firstTimestampUs < 0)
-            m_firstTimestampUs = pkt.timestampUs;
-
-        // Wireshark-style: seconds since the first packet of the session.
-        const double relSeconds = static_cast<double>(pkt.timestampUs - m_firstTimestampUs) / 1e6;
-
-        table->setItem(row, 0, makeNumericItem(QString::number(pkt.number)));
-        table->setItem(row, 1, makeNumericItem(QString::number(relSeconds, 'f', 6)));
-        table->setItem(row, 2, makeNumericItem(QString::number(pkt.originalLength)));
-        ++row;
-    }
-
-    m_totalPackets += static_cast<quint64>(batch.size());
-
-    table->setUpdatesEnabled(true);
-    if (followTail)
-        table->scrollToBottom();
-
-    updateStatusLabels();
-}
-
 void MainWindow::onCaptureError(const QString& message)
 {
-    QString text = message;
-
-    // Permission problems are the #1 first-run failure; be specific.
-    if (message.contains(QStringLiteral("permission"), Qt::CaseInsensitive)
-        || message.contains(QStringLiteral("not permitted"), Qt::CaseInsensitive)) {
-        text += tr("\n\nOn Linux, run as root or grant the binary capabilities:\n"
-                   "sudo setcap cap_net_raw,cap_net_admin=eip ./MicroWireshark");
-    }
-
-    QMessageBox::critical(this, tr("Capture error"), text);
+    QMessageBox::critical(this, tr("Capture error"), message);
 }
 
 void MainWindow::onCaptureStatistics(quint32 received, quint32 dropped)
 {
-    m_lastStatsText = tr("kernel received %1, dropped %2").arg(received).arg(dropped);
+    m_lastStatsText = tr("driver received %1, dropped %2").arg(received).arg(dropped);
 }
 
 void MainWindow::onCaptureFinished()
@@ -250,10 +243,30 @@ void MainWindow::onCaptureFinished()
     setState(State::Idle);
     updateStatusLabels();
 
-    QString msg = tr("Capture stopped \u2014 %1 packets displayed").arg(m_totalPackets);
+    QString msg = tr("Capture stopped \u2014 %1 packets").arg(m_model->packetCount());
     if (!m_lastStatsText.isEmpty())
         msg += QStringLiteral(" (%1)").arg(m_lastStatsText);
     statusBar()->showMessage(msg);
+}
+
+// ---------------------------------------------------------------------------
+// Auto-scroll
+// ---------------------------------------------------------------------------
+void MainWindow::onRowsAboutToBeInserted()
+{
+    // Follow the tail only if the user is parked at the bottom AND has not
+    // picked a row. Scrolling up or selecting a row both pin the view.
+    QTableView* view = ui->tablePackets;
+    const QScrollBar* vbar = view->verticalScrollBar();
+    const bool atBottom = vbar->value() >= vbar->maximum() - 1;
+    m_followTail = atBottom && !view->selectionModel()->hasSelection();
+}
+
+void MainWindow::onRowsInserted()
+{
+    updateStatusLabels();
+    if (m_followTail)
+        ui->tablePackets->scrollToBottom();
 }
 
 // ---------------------------------------------------------------------------
@@ -261,13 +274,12 @@ void MainWindow::onCaptureFinished()
 // ---------------------------------------------------------------------------
 void MainWindow::joinAndDeleteWorker()
 {
-    // wait() returns false on timeout; re-issuing quit() each round makes the
-    // join immune to the "quit() before exec() was entered" race.
+    // Re-issuing quit() each round makes the join immune to a quit() that
+    // arrived before the thread entered its event loop.
     while (!m_thread.wait(50))
         m_thread.quit();
 
-    // The thread is finished, so deleting its former QObject from here is safe.
-    delete m_worker;
+    delete m_worker;   // the thread is finished: safe from here
     m_worker = nullptr;
 }
 
@@ -277,5 +289,5 @@ void MainWindow::shutdownCapture()
         return;
 
     m_worker->requestStop();
-    joinAndDeleteWorker();   // blocks at most ~one pcap read timeout
+    joinAndDeleteWorker();   // blocks at most about one pcap read timeout
 }

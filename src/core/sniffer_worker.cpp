@@ -6,6 +6,8 @@
 
 #include <utility>
 
+#include "core/protocol_parser.h"
+
 SnifferWorker::SnifferWorker(QString deviceName, QObject* parent)
     : QObject(parent)
     , m_deviceName(std::move(deviceName))
@@ -55,12 +57,11 @@ QList<NetworkDevice> SnifferWorker::listDevices(QString* errorOut)
 // ---------------------------------------------------------------------------
 void SnifferWorker::requestStop()
 {
-    // 1) Flag first: covers the case where run() hasn't opened the device yet,
-    //    and acts as the fallback if breakloop doesn't wake a blocked read.
+    // Flag first: covers "not opened yet" and is the fallback if breakloop
+    // doesn't wake a blocked read.
     m_stopRequested.store(true);
 
-    // 2) Poke the blocked pcap read. The mutex guarantees the handle can't be
-    //    closed by the capture thread while we're using it.
+    // The mutex guarantees the handle can't be closed while we use it.
     QMutexLocker lock(&m_handleMutex);
     if (m_handle)
         pcap_breakloop(m_handle);
@@ -71,7 +72,6 @@ void SnifferWorker::requestStop()
 // ---------------------------------------------------------------------------
 void SnifferWorker::run()
 {
-    // Stop requested before we even got scheduled (e.g. window closed instantly).
     if (m_stopRequested.load()) {
         emit finished();
         return;
@@ -92,52 +92,46 @@ void SnifferWorker::run()
         return;
     }
 
-    // Publish the handle so requestStop() can reach it.
     {
         QMutexLocker lock(&m_handleMutex);
         m_handle = handle;
     }
 
-    emit captureStarted(pcap_datalink(handle));
+    m_linkType = pcap_datalink(handle);
+    emit captureStarted(m_linkType);
 
-    m_packetCounter = 0;
+    m_packetCounter    = 0;
+    m_firstTimestampUs = -1;
     m_pending.clear();
     m_pending.reserve(kBatchReserve);
     m_sinceFlush.start();
 
-    // pcap_dispatch() processes whatever the kernel buffer holds (or returns
-    // 0 on timeout). Unlike pcap_loop() it returns control to us regularly,
-    // so we can flush batches and check the stop flag even when traffic is
-    // sparse. Note: no QTimer here on purpose. A QTimer needs an event loop
-    // on this thread, and this loop IS the thread's work, so the timer would
-    // never fire. Flushing is driven by m_sinceFlush from inside the loop
-    // and from inside the per-packet callback instead.
+    // No QTimer here on purpose: this loop IS the thread's work, so a timer
+    // living in this thread would never fire. Flushing is driven by
+    // m_sinceFlush from inside the loop and from inside the packet callback.
     while (!m_stopRequested.load()) {
         const int rc = pcap_dispatch(handle, -1, &SnifferWorker::pcapCallback,
                                      reinterpret_cast<unsigned char*>(this));
 
-        if (rc == PCAP_ERROR_BREAK)          // pcap_breakloop() was called
+        if (rc == PCAP_ERROR_BREAK)
             break;
 
-        if (rc < 0) {                        // PCAP_ERROR or other fatal error
+        if (rc < 0) {
             emit captureError(tr("Capture failed: %1")
                                   .arg(QString::fromLocal8Bit(pcap_geterr(handle))));
             break;
         }
 
-        // rc >= 0: either packets were processed or the read timed out.
         if (m_sinceFlush.elapsed() >= kFlushIntervalMs)
             flushBatch();
     }
 
-    // Deliver whatever is still buffered so no packets are lost on stop.
-    flushBatch();
+    flushBatch();   // deliver the tail so no packets are lost on stop
 
     pcap_stat stats{};
     if (pcap_stats(handle, &stats) == 0)
         emit captureStatistics(stats.ps_recv, stats.ps_drop);
 
-    // Unpublish BEFORE closing so requestStop() can never see a dangling handle.
     {
         QMutexLocker lock(&m_handleMutex);
         m_handle = nullptr;
@@ -148,7 +142,7 @@ void SnifferWorker::run()
 }
 
 // ---------------------------------------------------------------------------
-// Per-packet path (hot; keep it cheap)
+// Per-packet path (hot)
 // ---------------------------------------------------------------------------
 void SnifferWorker::pcapCallback(unsigned char* user,
                                  const pcap_pkthdr* header,
@@ -159,20 +153,21 @@ void SnifferWorker::pcapCallback(unsigned char* user,
 
 void SnifferWorker::handlePacket(const pcap_pkthdr* header, const unsigned char* bytes)
 {
-    RawPacket pkt;
-    pkt.number         = ++m_packetCounter;
-    pkt.timestampUs    = static_cast<qint64>(header->ts.tv_sec) * 1000000
+    RawPacket raw;
+    raw.number         = ++m_packetCounter;
+    raw.timestampUs    = static_cast<qint64>(header->ts.tv_sec) * 1000000
                       + static_cast<qint64>(header->ts.tv_usec);
-    pkt.originalLength = header->len;
-    // pcap reuses its buffer after the callback returns, so we MUST copy here.
-    pkt.data = QByteArray(reinterpret_cast<const char*>(bytes),
+    raw.originalLength = header->len;
+    // pcap reuses its buffer after the callback returns, so we MUST copy.
+    raw.data = QByteArray(reinterpret_cast<const char*>(bytes),
                           static_cast<qsizetype>(header->caplen));
 
-    m_pending.append(std::move(pkt));
+    if (m_firstTimestampUs < 0)
+        m_firstTimestampUs = raw.timestampUs;
 
-    // A single pcap_dispatch() call can deliver thousands of packets from a
-    // full kernel buffer; checking here keeps GUI updates on a steady cadence
-    // even then. (QElapsedTimer is a vDSO clock read, ~tens of ns.)
+    // Dissect here: the GUI thread never parses anything.
+    m_pending.append(ProtocolParser::dissect(std::move(raw), m_linkType, m_firstTimestampUs));
+
     if (m_sinceFlush.elapsed() >= kFlushIntervalMs)
         flushBatch();
 }
@@ -187,10 +182,9 @@ void SnifferWorker::flushBatch()
     if (m_pending.isEmpty())
         return;
 
-    // Swap the full buffer out and immediately keep collecting into a fresh
-    // one. Only the capture thread touches m_pending; the batch crosses to
-    // the GUI thread by value through a queued signal (implicitly shared,
-    // so no payload copy). Ownership transfer replaces locking.
+    // Swap the full buffer out and keep collecting into a fresh one. Only the
+    // capture thread touches m_pending; the batch crosses to the GUI thread by
+    // value through a queued signal (implicitly shared, no deep copy).
     PacketBatch outgoing;
     outgoing.swap(m_pending);
     m_pending.reserve(kBatchReserve);

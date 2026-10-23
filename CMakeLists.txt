@@ -71,6 +71,10 @@ add_executable(TrafficSNF
     src/mainwindow.cpp
     src/mainwindow.ui
     src/core/packet_types.h
+    src/core/protocol_parser.h
+    src/core/protocol_parser.cpp
+    src/core/packet_table_model.h
+    src/core/packet_table_model.cpp
     src/core/sniffer_worker.h
     src/core/sniffer_worker.cpp
 )
