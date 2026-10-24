@@ -31,7 +31,7 @@
 ## Сборка
 
 ```bash
-git clone [https://github.com/AbdulatifYusupov/SNF.git](https://github.com/AbdulatifYusupov/SNF.git)
+git clone [https://github.com/AbdulatifYusupov/SNF.git](https://github.com/AbdulatifYusupov/TrafficSNF.git)
 cd SNF
 mkdir build && cd build
 cmake ..
