@@ -1,8 +1,24 @@
-﻿# Build and cache directories
+# Build and cache directories
 build/
 .qtcreator/
 CMakeLists.txt.user*
 *.autosave
+
+# CMake generated
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+Makefile
+*.cmake
+!CMakeLists.txt
+
+# IDE / editor
+.vscode/
+.idea/
+*.user
+*.suo
+*.ncb
 
 # Compiled binaries and objects
 *.obj
@@ -12,3 +28,12 @@ CMakeLists.txt.user*
 *.dll
 *.exe
 *.manifest
+*.so
+*.dylib
+
+# Qt
+*.qmlc
+*.jsc
+ moc_*.cpp
+ ui_*.h
+ qrc_*.cpp
