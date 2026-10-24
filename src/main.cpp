@@ -6,7 +6,8 @@
 int main(int argc, char* argv[])
 {
     QApplication app(argc, argv);
-    QApplication::setApplicationName(QStringLiteral("Micro-Wireshark"));
+    QApplication::setApplicationName(QStringLiteral("TrafficSNF"));
+    QApplication::setApplicationDisplayName(QStringLiteral("TrafficSNF (Micro-Wireshark)"));
 
     // Qt 6 usually registers QList<T> automatically, but queued connections
     // look types up by name, so be explicit about the alias we put in signals.
