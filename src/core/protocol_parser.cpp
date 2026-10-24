@@ -411,7 +411,7 @@ void parseIcmp(Ctx& c, const L3& l3, int off, bool v6)
     f.icmpCode = i[1];
     f.checksum = be16(i + 2);
     f.transportHeaderLength = 8;
-    f.payloadLength = (l3.payloadEnd > off + 8) ? static_cast<quint32>(l3.payloadEnd - off + 8) : 0;
+    f.payloadLength = (l3.payloadEnd > off + 8) ? static_cast<quint32>(l3.payloadEnd - off - 8) : 0;
 
     p.layers.append(LayerInfo{v6 ? LayerType::ICMPv6 : LayerType::ICMP, off, qMin(8, c.size - off)});
     appendPayloadLayer(c, off + 8, f.payloadLength);
