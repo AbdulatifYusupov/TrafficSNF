@@ -58,25 +58,13 @@ struct L3
 // ===========================================================================
 QString macStr(const uchar* m)
 {
-    // Avoid QString::asprintf (locale + format-string overhead on hot path).
-    static const char hex[] = "0123456789abcdef";
-    char buf[18];
-    buf[0]  = hex[m[0] >> 4]; buf[1]  = hex[m[0] & 0xf]; buf[2]  = ':';
-    buf[3]  = hex[m[1] >> 4]; buf[4]  = hex[m[1] & 0xf]; buf[5]  = ':';
-    buf[6]  = hex[m[2] >> 4]; buf[7]  = hex[m[2] & 0xf]; buf[8]  = ':';
-    buf[9]  = hex[m[3] >> 4]; buf[10] = hex[m[3] & 0xf]; buf[11] = ':';
-    buf[12] = hex[m[4] >> 4]; buf[13] = hex[m[4] & 0xf]; buf[14] = ':';
-    buf[15] = hex[m[5] >> 4]; buf[16] = hex[m[5] & 0xf]; buf[17] = '\0';
-    return QString::fromLatin1(buf, 17);
+    return QString::asprintf("%02x:%02x:%02x:%02x:%02x:%02x",
+                             m[0], m[1], m[2], m[3], m[4], m[5]);
 }
 
 QString ipv4Str(const uchar* b)
 {
-    // Faster than asprintf for the hot path (called twice per IPv4 packet).
-    return QString::number(b[0]) + QLatin1Char('.')
-         + QString::number(b[1]) + QLatin1Char('.')
-         + QString::number(b[2]) + QLatin1Char('.')
-         + QString::number(b[3]);
+    return QString::asprintf("%d.%d.%d.%d", b[0], b[1], b[2], b[3]);
 }
 
 /// RFC 5952: lowercase, no leading zeros, longest run (>= 2) of zero groups -> "::".
@@ -565,3 +553,263 @@ void parseIpv6(Ctx& c, int off)
             cur += (c.at(cur)[1] + 1) * 8;
             next = following;
         } else if (next == IpProto::kAh) {
+            if (!c.has(cur, 2)) break;
+            const quint8 following = c.at(cur)[0];
+            cur += (c.at(cur)[1] + 2) * 4;
+            next = following;
+        } else if (next == IpProto::kFragment) {
+            if (!c.has(cur, 8)) break;
+            const quint8  following = c.at(cur)[0];
+            const quint16 fragOff   = be16(c.at(cur) + 2) >> 3;
+            cur += 8;
+            next = following;
+            if (fragOff != 0) {
+                nonFirstFragment = true;
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    const bool stillExt = (next == IpProto::kHopByHop || next == IpProto::kRouting
+                           || next == IpProto::kDestOpts || next == IpProto::kAh
+                           || next == IpProto::kFragment);
+    if (cur > c.size || (stillExt && !nonFirstFragment)) {
+        p.layers.append(LayerInfo{LayerType::IPv6, off, qMin(cur - off, c.size - off)});
+        p.info = QStringLiteral("[Truncated IPv6 extension headers]");
+        return;
+    }
+
+    f.ipHeaderLength = static_cast<quint16>(cur - off);
+    f.ipProtocol     = next;
+    p.layers.append(LayerInfo{LayerType::IPv6, off, cur - off});
+
+    if (nonFirstFragment) {
+        f.payloadLength = (l3.payloadEnd > cur) ? static_cast<quint32>(l3.payloadEnd - cur) : 0;
+        appendPayloadLayer(c, cur, f.payloadLength);
+        p.info = QStringLiteral("Fragmented IPv6 protocol (next header=%1)").arg(int(next));
+        return;
+    }
+    if (next == IpProto::kNoNext) {
+        p.info = QStringLiteral("No next header");
+        return;
+    }
+
+    parseTransport(c, l3, next, cur);
+}
+
+// ===========================================================================
+// ARP and other EtherTypes
+// ===========================================================================
+void parseArp(Ctx& c, int off)
+{
+    DissectedPacket& p = c.pkt;
+    p.protocol = QStringLiteral("ARP");   // source/destination stay the Ethernet MACs
+
+    if (!c.has(off, 8)) {
+        p.info = QStringLiteral("[Truncated ARP packet]");
+        return;
+    }
+
+    const uchar*  a     = c.at(off);
+    const quint16 htype = be16(a);
+    const quint16 ptype = be16(a + 2);
+    const quint8  hlen  = a[4];
+    const quint8  plen  = a[5];
+    const quint16 op    = be16(a + 6);
+
+    if (htype == 1 && ptype == kEtherIPv4 && hlen == 6 && plen == 4 && c.has(off, 28)) {
+        p.layers.append(LayerInfo{LayerType::ARP, off, 28});
+        const QString senderIp = ipv4Str(a + 14);
+        const QString targetIp = ipv4Str(a + 24);
+
+        if (op == 1) {
+            p.info = (senderIp == targetIp)
+                ? QStringLiteral("Gratuitous ARP for %1 (Request)").arg(targetIp)
+                : QStringLiteral("Who has %1? Tell %2").arg(targetIp, senderIp);
+        } else if (op == 2) {
+            p.info = QStringLiteral("%1 is at %2").arg(senderIp, macStr(a + 8));
+        } else {
+            p.info = QStringLiteral("ARP opcode %1: %2 -> %3").arg(int(op)).arg(senderIp, targetIp);
+        }
+    } else {
+        p.layers.append(LayerInfo{LayerType::ARP, off, qMin(8 + 2 * (hlen + plen), c.size - off)});
+        p.info = QStringLiteral("ARP (htype=%1, ptype=0x%2, opcode=%3)")
+                     .arg(int(htype)).arg(int(ptype), 4, 16, QLatin1Char('0')).arg(int(op));
+    }
+}
+
+void parseOtherEtherType(Ctx& c, quint16 etherType, int off)
+{
+    DissectedPacket& p = c.pkt;
+    const int payload = qMax(0, c.size - off);
+
+    if (etherType <= 1500) {
+        p.protocol = QStringLiteral("802.3");
+        p.info = QStringLiteral("IEEE 802.3 frame (LLC/STP), length %1").arg(int(etherType));
+        return;
+    }
+
+    const char* name = nullptr;
+    switch (etherType) {
+    case 0x88CC: name = "LLDP";   break;
+    case 0x888E: name = "EAPOL";  break;
+    case 0x8847:
+    case 0x8848: name = "MPLS";   break;
+    case 0x8863:
+    case 0x8864: name = "PPPoE";  break;
+    case 0x88F7: name = "PTP";    break;
+    default: break;
+    }
+    p.protocol = name ? QString::fromLatin1(name) : QStringLiteral("Ethernet");
+    p.info = QStringLiteral("EtherType 0x%1, %2 bytes")
+                 .arg(int(etherType), 4, 16, QLatin1Char('0')).arg(payload);
+}
+
+void parseNetwork(Ctx& c, quint16 etherType, int off)
+{
+    switch (etherType) {
+    case kEtherIPv4: parseIpv4(c, off);                  break;
+    case kEtherIPv6: parseIpv6(c, off);                  break;
+    case kEtherARP:  parseArp(c, off);                   break;
+    default:         parseOtherEtherType(c, etherType, off); break;
+    }
+}
+
+// ===========================================================================
+// Layer 2 / link types
+// ===========================================================================
+void parseEthernet(Ctx& c)
+{
+    DissectedPacket& p = c.pkt;
+    PacketFields&    f = p.fields;
+
+    p.protocol = QStringLiteral("Ethernet");
+    if (!c.has(0, 14)) {
+        p.info = QStringLiteral("[Truncated Ethernet frame]");
+        return;
+    }
+
+    std::memcpy(f.dstMac.data(), c.at(0), 6);
+    std::memcpy(f.srcMac.data(), c.at(6), 6);
+    f.hasEthernet = true;
+
+    quint16 etherType = be16(c.at(12));
+    int     hdrLen    = 14;
+
+    // 802.1Q / 802.1ad tags: TCI (2 bytes) + inner EtherType (2 bytes) each.
+    while ((etherType == kEtherVlan || etherType == kEtherQinQ) && c.has(hdrLen, 4)) {
+        etherType = be16(c.at(hdrLen + 2));
+        hdrLen += 4;
+    }
+    f.etherType = etherType;
+
+    p.layers.append(LayerInfo{LayerType::Ethernet, 0, hdrLen});
+    p.source      = macStr(c.at(6));
+    p.destination = macStr(c.at(0));
+
+    parseNetwork(c, etherType, hdrLen);
+}
+
+/// Dispatch on the IP version nibble at `off` (used by loopback and raw-IP link types).
+void parseIpByVersion(Ctx& c, int off)
+{
+    DissectedPacket& p = c.pkt;
+    if (!c.has(off, 1)) {
+        p.info = QStringLiteral("[Empty packet]");
+        return;
+    }
+    const int version = c.at(off)[0] >> 4;
+    if (version == 4)
+        parseIpv4(c, off);
+    else if (version == 6)
+        parseIpv6(c, off);
+    else
+        p.info = QStringLiteral("Unknown payload (first nibble %1)").arg(version);
+}
+
+/// DLT_NULL / DLT_LOOP: 4-byte address-family header (byte order and AF_INET6
+/// values differ per OS, so we ignore it and sniff the IP version instead).
+/// This is what the Npcap Loopback Adapter produces on Windows.
+void parseLoopback(Ctx& c)
+{
+    DissectedPacket& p = c.pkt;
+    p.protocol = QStringLiteral("Loopback");
+    if (!c.has(0, 4)) {
+        p.info = QStringLiteral("[Truncated loopback header]");
+        return;
+    }
+    p.layers.append(LayerInfo{LayerType::Loopback, 0, 4});
+    parseIpByVersion(c, 4);
+}
+
+} // namespace
+
+// ===========================================================================
+// Public API
+// ===========================================================================
+DissectedPacket ProtocolParser::dissect(RawPacket raw, int linkType, qint64 firstTimestampUs)
+{
+    DissectedPacket pkt;
+    pkt.number      = raw.number;
+    pkt.timestampUs = raw.timestampUs;
+    pkt.relativeUs  = raw.timestampUs - firstTimestampUs;
+    pkt.wireLength  = raw.originalLength;
+    pkt.data        = std::move(raw.data);
+    pkt.protocol    = QStringLiteral("Unknown");
+    pkt.layers.reserve(4);
+
+    // pkt.data is not modified below, so this pointer stays valid.
+    Ctx ctx{pkt, reinterpret_cast<const uchar*>(pkt.data.constData()),
+            static_cast<int>(pkt.data.size())};
+
+    switch (linkType) {
+    case DLT_EN10MB:
+        parseEthernet(ctx);
+        break;
+    case DLT_NULL:
+    case DLT_LOOP:
+        parseLoopback(ctx);
+        break;
+    case DLT_RAW:
+        parseIpByVersion(ctx, 0);
+        break;
+    default:
+        pkt.info = QStringLiteral("Unsupported link type %1").arg(linkType);
+        break;
+    }
+    return pkt;
+}
+
+QString ProtocolParser::serviceName(quint16 port, quint8 ipProtocol)
+{
+    const char* n = serviceCStr(port, ipProtocol);
+    return n ? QString::fromLatin1(n) : QString();
+}
+
+QString ProtocolParser::tcpFlagsToString(quint16 flags)
+{
+    // Same order Wireshark uses: FIN, SYN, RST, PSH, ACK, URG, ECE, CWR.
+    static const char* const kNames[8] = {"FIN", "SYN", "RST", "PSH", "ACK", "URG", "ECE", "CWR"};
+
+    QString s;
+    for (int bit = 0; bit < 8; ++bit) {
+        if (flags & (1u << bit)) {
+            if (!s.isEmpty())
+                s += QLatin1String(", ");
+            s += QLatin1String(kNames[bit]);
+        }
+    }
+    return s.isEmpty() ? QStringLiteral("<None>") : s;
+}
+
+QString ProtocolParser::macToString(const MacAddress& mac)
+{
+    return macStr(mac.data());
+}
+
+QString ProtocolParser::ipToString(const IpAddressBytes& addr, int ipVersion)
+{
+    return ipVersion == 6 ? ipv6Str(addr.data()) : ipv4Str(addr.data());
+}
