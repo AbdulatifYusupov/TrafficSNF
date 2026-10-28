@@ -51,9 +51,7 @@ The parser never reads past the captured length. Every layer checks the remainin
 | Npcap (driver) | installed, with WinPcap API-compatible mode |
 | Npcap SDK | headers and libs, from <https://npcap.com> |
 
-Developed and tested on Windows 10/11. Linux support isn't there yet (see [Roadmap](#roadmap)).
-
-## Build
+Developed and tested on Windows 11/Kali Linux Build
 
 ```bash
 git clone https://github.com/AbdulatifYusupov/TrafficSNF.git
