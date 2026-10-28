@@ -64,6 +64,7 @@ private:
     QLabel* m_labelCount     = nullptr;
 
     QString m_currentInterface;
+    QString m_currentFilter;
     QString m_lastStatsText;
 
     /// Decided just before each insertion: should the view follow the tail?

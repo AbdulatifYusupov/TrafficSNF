@@ -51,6 +51,27 @@
      </layout>
     </item>
     <item>
+     <layout class="QHBoxLayout" name="filterLayout">
+      <item>
+       <widget class="QLabel" name="labelFilter">
+        <property name="text">
+         <string>Capture filter:</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QLineEdit" name="lineFilter">
+        <property name="placeholderText">
+         <string>BPF expression, e.g.  tcp port 443   |   host 10.0.0.5 and not port 22</string>
+        </property>
+        <property name="clearButtonEnabled">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </item>
+    <item>
      <widget class="QTableView" name="tablePackets"/>
     </item>
    </layout>

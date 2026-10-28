@@ -8,6 +8,7 @@
 #include <QHeaderView>
 #include <QItemSelectionModel>
 #include <QLabel>
+#include <QLineEdit>
 #include <QMessageBox>
 #include <QScrollBar>
 #include <QShortcut>
@@ -34,6 +35,16 @@ MainWindow::MainWindow(QWidget* parent)
 
     connect(ui->btnStart, &QPushButton::clicked, this, &MainWindow::onStartClicked);
     connect(ui->btnStop,  &QPushButton::clicked, this, &MainWindow::onStopClicked);
+
+    // BPF filter box: live syntax check (red border + error tooltip), Enter starts.
+    connect(ui->lineFilter, &QLineEdit::textChanged, this, [this](const QString& text) {
+        QString error;
+        const bool ok = SnifferWorker::validateFilter(text, &error);
+        ui->lineFilter->setStyleSheet(ok ? QString()
+                                         : QStringLiteral("QLineEdit { border: 1px solid #d9534f; }"));
+        ui->lineFilter->setToolTip(ok ? QString() : error);
+    });
+    connect(ui->lineFilter, &QLineEdit::returnPressed, ui->btnStart, &QPushButton::click);
 
     // Auto-scroll bookkeeping: decide BEFORE the rows arrive (scrollbar still
     // reflects what the user is looking at), act AFTER the view has relaid out.
@@ -142,6 +153,7 @@ void MainWindow::setState(State state)
     const bool haveDevices = ui->comboInterfaces->count() > 0;
 
     ui->comboInterfaces->setEnabled(state == State::Idle && haveDevices);
+    ui->lineFilter->setEnabled(state == State::Idle);
     ui->btnStart->setEnabled(state == State::Idle && haveDevices);
     ui->btnStop->setEnabled(state == State::Running);
 
@@ -175,8 +187,9 @@ void MainWindow::onStartClicked()
     m_followTail = true;
     m_lastStatsText.clear();
     m_currentInterface = device;
+    m_currentFilter    = ui->lineFilter->text().trimmed();
 
-    m_worker = new SnifferWorker(device);   // no parent: it will move threads
+    m_worker = new SnifferWorker(device, m_currentFilter);   // no parent: it will move threads
     m_worker->moveToThread(&m_thread);
 
     // QUEUED on purpose: run() must execute from inside the thread's event
@@ -220,8 +233,11 @@ void MainWindow::onStopClicked()
 // ---------------------------------------------------------------------------
 void MainWindow::onCaptureStarted(int linkType)
 {
-    statusBar()->showMessage(tr("Capturing on %1 (link type %2)")
-                                 .arg(m_currentInterface).arg(linkType));
+    QString msg = tr("Capturing on %1 (link type %2)")
+    .arg(m_currentInterface).arg(linkType);
+    if (!m_currentFilter.isEmpty())
+        msg += tr(", filter: %1").arg(m_currentFilter);
+    statusBar()->showMessage(msg);
 }
 
 void MainWindow::onCaptureError(const QString& message)

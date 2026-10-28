@@ -45,10 +45,18 @@ public:
     static constexpr int kFlushIntervalMs = 40;
     static constexpr int kBatchReserve    = 1024;
 
-    explicit SnifferWorker(QString deviceName, QObject* parent = nullptr);
+    /// captureFilter is a BPF expression ("tcp port 443"); empty = capture everything.
+    explicit SnifferWorker(QString deviceName,
+                           QString captureFilter = QString(),
+                           QObject* parent = nullptr);
     ~SnifferWorker() override;
 
     static QList<NetworkDevice> listDevices(QString* errorOut = nullptr);
+
+    /// Dry-run compile of a BPF expression (against Ethernet) for instant UI
+    /// feedback. The authoritative check still happens in run() on the real
+    /// device, because a few filters depend on the link type.
+    static bool validateFilter(const QString& filter, QString* errorOut = nullptr);
 
     /// Thread-safe. Returns immediately; completion is signalled via finished().
     void requestStop();
@@ -72,6 +80,7 @@ private:
     void flushBatch();
 
     const QString m_deviceName;
+    const QString m_filter;
 
     // Cross-thread control state.
     std::atomic<bool> m_stopRequested{false};

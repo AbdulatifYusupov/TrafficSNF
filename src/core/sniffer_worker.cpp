@@ -2,15 +2,17 @@
 
 #include <pcap/pcap.h>
 
+#include <QByteArray>
 #include <QMutexLocker>
 
 #include <utility>
 
 #include "core/protocol_parser.h"
 
-SnifferWorker::SnifferWorker(QString deviceName, QObject* parent)
+SnifferWorker::SnifferWorker(QString deviceName, QString captureFilter, QObject* parent)
     : QObject(parent)
     , m_deviceName(std::move(deviceName))
+    , m_filter(captureFilter.trimmed())
 {
 }
 
@@ -53,6 +55,34 @@ QList<NetworkDevice> SnifferWorker::listDevices(QString* errorOut)
 }
 
 // ---------------------------------------------------------------------------
+// BPF filter validation (GUI thread, only while no capture is running)
+// ---------------------------------------------------------------------------
+bool SnifferWorker::validateFilter(const QString& filter, QString* errorOut)
+{
+    if (filter.trimmed().isEmpty())
+        return true;
+
+    pcap_t* dead = pcap_open_dead(DLT_EN10MB, kSnapLen);
+    if (!dead) {
+        if (errorOut)
+            *errorOut = QStringLiteral("pcap_open_dead failed");
+        return false;
+    }
+
+    bpf_program prog{};
+    const QByteArray expr = filter.toLocal8Bit();
+    const bool ok = pcap_compile(dead, &prog, expr.constData(), 1, PCAP_NETMASK_UNKNOWN) == 0;
+
+    if (ok)
+        pcap_freecode(&prog);
+    else if (errorOut)
+        *errorOut = QString::fromLocal8Bit(pcap_geterr(dead));
+
+    pcap_close(dead);
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
 // Stop request (called from the GUI thread)
 // ---------------------------------------------------------------------------
 void SnifferWorker::requestStop()
@@ -90,6 +120,30 @@ void SnifferWorker::run()
                               .arg(m_deviceName, QString::fromLocal8Bit(errbuf)));
         emit finished();
         return;
+    }
+
+    // Install the BPF filter before the handle is published to requestStop():
+    // on failure nobody else has seen the handle, so we can just close it.
+    // The kernel/driver then drops non-matching packets before they ever reach us.
+    if (!m_filter.isEmpty()) {
+        bpf_program prog{};
+        const QByteArray expr = m_filter.toLocal8Bit();
+
+        const bool compiled = pcap_compile(handle, &prog, expr.constData(), 1,
+                                           PCAP_NETMASK_UNKNOWN) == 0;
+        bool installed = false;
+        if (compiled) {
+            installed = pcap_setfilter(handle, &prog) == 0;
+            pcap_freecode(&prog);
+        }
+
+        if (!compiled || !installed) {
+            emit captureError(tr("Capture filter '%1' rejected: %2")
+                                  .arg(m_filter, QString::fromLocal8Bit(pcap_geterr(handle))));
+            pcap_close(handle);
+            emit finished();
+            return;
+        }
     }
 
     {
