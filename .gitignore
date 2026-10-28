@@ -1,24 +1,38 @@
-# Build and cache directories
+# Build directories (Qt Creator uses build/<kit>/, plain CMake uses build/ or out/)
 build/
+build-*/
+out/
+cmake-build-*/
+
+# Qt Creator / IDEs
 .qtcreator/
 CMakeLists.txt.user*
 *.autosave
-
-# CMake generated
-CMakeCache.txt
-CMakeFiles/
-cmake_install.cmake
-compile_commands.json
-Makefile
-*.cmake
-!CMakeLists.txt
-
-# IDE / editor
 .vscode/
 .idea/
+.vs/
 *.user
 *.suo
 *.ncb
+
+# CMake generated (only at repo root, in case of an in-source build)
+/CMakeCache.txt
+/CMakeFiles/
+/cmake_install.cmake
+/compile_commands.json
+/Makefile
+/Testing/
+/_deps/
+
+# Qt autogen
+*_autogen/
+moc_*.cpp
+moc_*.cpp.d
+ui_*.h
+qrc_*.cpp
+*.qmlc
+*.jsc
+*.qm
 
 # Compiled binaries and objects
 *.obj
@@ -28,12 +42,16 @@ Makefile
 *.dll
 *.exe
 *.manifest
+*.pdb
+*.ilk
 *.so
 *.dylib
 
-# Qt
-*.qmlc
-*.jsc
- moc_*.cpp
- ui_*.h
- qrc_*.cpp
+# Captures (can contain private traffic, never commit real ones)
+*.pcap
+*.pcapng
+!tests/data/*.pcap
+
+# OS junk
+Thumbs.db
+.DS_Store
