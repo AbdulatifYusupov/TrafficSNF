@@ -51,7 +51,7 @@ The parser never reads past the captured length. Every layer checks the remainin
 | Npcap (driver) | installed, with WinPcap API-compatible mode |
 | Npcap SDK | headers and libs, from <https://npcap.com> |
 
-Developed and tested on Windows 10/11. Linux support isn't there yet (see [Roadmap](#roadmap)).
+Developed on Windows 11 (MinGW-w64 / MSVC) and tested on Kali Linux.
 
 ## Build
 
