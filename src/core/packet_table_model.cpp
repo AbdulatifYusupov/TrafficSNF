@@ -1,6 +1,9 @@
 #include "core/packet_table_model.h"
 
+#include <QBrush>
+#include <QColor>
 #include <QFontDatabase>
+#include <QHash>
 #include <QThread>
 
 #include <algorithm>
@@ -21,6 +24,86 @@ bool lessThan(const DissectedPacket& a, const DissectedPacket& b, int column)
     case PacketTableModel::ColInfo:        return a.info < b.info;
     default:                               return a.number < b.number;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Row colouring (Wireshark-style: one colour per protocol family)
+// ---------------------------------------------------------------------------
+enum class RowKind { Default, Tcp, Web, Secure, Udp, Name, Icmp, Arp, Reset };
+
+RowKind classify(const DissectedPacket& p)
+{
+    const PacketFields& f = p.fields;
+
+    // A TCP reset is the one thing worth spotting at a glance, whatever the
+    // protocol label says (port scans and refused connections show up as red).
+    if (f.ipProtocol == IpProto::kTcp && (f.tcpFlags & TcpFlag::kRst))
+        return RowKind::Reset;
+
+    static const QHash<QString, RowKind> byName = {
+                                                    { QStringLiteral("ARP"),       RowKind::Arp    },
+                                                    { QStringLiteral("ICMP"),      RowKind::Icmp   },
+                                                    { QStringLiteral("ICMPv6"),    RowKind::Icmp   },
+                                                    { QStringLiteral("DNS"),       RowKind::Name   },
+                                                    { QStringLiteral("mDNS"),      RowKind::Name   },
+                                                    { QStringLiteral("LLMNR"),     RowKind::Name   },
+                                                    { QStringLiteral("NBNS"),      RowKind::Name   },
+                                                    { QStringLiteral("HTTP"),      RowKind::Web    },
+                                                    { QStringLiteral("HTTP-Alt"),  RowKind::Web    },
+                                                    { QStringLiteral("TLS"),       RowKind::Secure },
+                                                    { QStringLiteral("HTTPS"),     RowKind::Secure },
+                                                    { QStringLiteral("HTTPS-Alt"), RowKind::Secure },
+                                                    { QStringLiteral("QUIC"),      RowKind::Secure },
+                                                    { QStringLiteral("DoT"),       RowKind::Secure },
+                                                    { QStringLiteral("SMTPS"),     RowKind::Secure },
+                                                    { QStringLiteral("IMAPS"),     RowKind::Secure },
+                                                    { QStringLiteral("POP3S"),     RowKind::Secure },
+                                                    { QStringLiteral("LDAPS"),     RowKind::Secure },
+                                                    };
+
+    const auto it = byName.constFind(p.protocol);
+    if (it != byName.constEnd())
+        return it.value();
+
+    // Everything else (SSH, SSDP, DHCP, NTP, plain "TCP"/"UDP", ...) falls back
+    // to its transport, so a new service label never ends up uncoloured.
+    if (f.ipProtocol == IpProto::kTcp) return RowKind::Tcp;
+    if (f.ipProtocol == IpProto::kUdp) return RowKind::Udp;
+    return RowKind::Default;
+}
+
+/// Light pastel backgrounds paired with one dark text colour, so the rows stay
+/// readable on both light and dark system themes.
+const QBrush& backgroundFor(RowKind kind)
+{
+    static const QBrush tcp    (QColor::fromRgb(0xE7E6FF));
+    static const QBrush web    (QColor::fromRgb(0xE4FFC7));
+    static const QBrush secure (QColor::fromRgb(0xC9D9FF));
+    static const QBrush udp    (QColor::fromRgb(0xDAEEFF));
+    static const QBrush name   (QColor::fromRgb(0xC8F2E4));
+    static const QBrush icmp   (QColor::fromRgb(0xFCE0FF));
+    static const QBrush arp    (QColor::fromRgb(0xFAF0D7));
+    static const QBrush reset  (QColor::fromRgb(0xF8B4B4));
+    static const QBrush none;
+
+    switch (kind) {
+    case RowKind::Tcp:    return tcp;
+    case RowKind::Web:    return web;
+    case RowKind::Secure: return secure;
+    case RowKind::Udp:    return udp;
+    case RowKind::Name:   return name;
+    case RowKind::Icmp:   return icmp;
+    case RowKind::Arp:    return arp;
+    case RowKind::Reset:  return reset;
+    case RowKind::Default: break;
+    }
+    return none;
+}
+
+const QBrush& textBrush()
+{
+    static const QBrush dark(QColor::fromRgb(0x1B1B1B));
+    return dark;
 }
 
 } // namespace
@@ -74,6 +157,16 @@ QVariant PacketTableModel::data(const QModelIndex& index, int role) const
         if (col == ColSource || col == ColDestination || col == ColInfo)
             return m_monoFont;
         return {};
+
+    case Qt::BackgroundRole: {
+        const RowKind kind = classify(p);
+        return kind == RowKind::Default ? QVariant()
+                                        : QVariant::fromValue(backgroundFor(kind));
+    }
+
+    case Qt::ForegroundRole:
+        return classify(p) == RowKind::Default ? QVariant()
+                                               : QVariant::fromValue(textBrush());
 
     case Qt::ToolTipRole:
         if (col == ColInfo || col == ColSource || col == ColDestination)
