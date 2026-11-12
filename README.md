@@ -8,13 +8,16 @@ A lightweight real-time packet sniffer with a native desktop GUI, written in C++
 
 ## Features
 
-- Lists network interfaces and captures live traffic on the one you pick
+- Lists network interfaces and captures live traffic with optional **BPF capture filters** (live syntax validation)
+- **Live display filter** with boolean expressions (`and`/`or`/`not`, `ip`, `ip.src`, `ip.dst`, `port`, `tcp.rst`, protocol names, or text search)
+- **Three-pane Wireshark-style layout**: colour-coded packet table, hierarchical **packet details tree**, and synchronized **hex + ASCII dump** with byte-range highlighting
+- **Open & Save `.pcap` files** (`Ctrl+O` / `Ctrl+S`) via `libpcap`
 - Capture runs on its own thread, so the UI stays responsive at high packet rates
 - Dissects packets on the fly:
-  - **L2:** Ethernet II, 802.1Q VLAN tags, loopback / null link types
+  - **L2:** Ethernet II, 802.1Q / 802.1ad VLAN tags, loopback / null link types, Linux cooked capture (`DLT_LINUX_SLL` / `DLT_LINUX_SLL2`)
   - **L3:** IPv4, IPv6 (including extension headers), ICMP / ICMPv6 with readable type names, IGMP, GRE, ESP, AH, OSPF, SCTP
-  - **L4:** TCP (ports, flags), UDP
-  - **L7 (by port and payload):** DNS, mDNS, LLMNR, DHCP, SSDP, HTTP, TLS (record type detected from the payload, not just the port), QUIC, SSH, SMB, RDP and about 40 other common services
+  - **L4:** TCP (ports, flags, seq/ack), UDP
+  - **L7 (by port and payload):** DNS/mDNS query & response summaries, HTTP request/status lines, TLS record types, QUIC, SSH, SMB, RDP and ~40 common services
 - Sortable packet table that auto-scrolls only while you're at the bottom, so you can stop and read without it jumping away
 - Driver statistics when the capture ends (packets received / dropped by the kernel)
 - Truncated or malformed packets still show up as rows instead of being dropped or crashing the parser
@@ -24,12 +27,15 @@ A lightweight real-time packet sniffer with a native desktop GUI, written in C++
 ```
 src/
 ├── main.cpp
-├── mainwindow.{h,cpp,ui}      # Qt Widgets UI: interface picker, start/stop, status bar
+├── mainwindow.{h,cpp,ui}      # Qt Widgets UI: controls, splitters, filters, status bar
+├── packet_details_widget.*    # Protocol-layer dissection tree with byte-range selection
+├── hex_view_widget.*          # Hex + ASCII byte viewer with synchronized highlighting
 └── core/
-    ├── sniffer_worker.*       # pcap capture loop on a QThread, batches packets
-    ├── protocol_parser.*      # bounds-checked dissector (Ethernet → IP → TCP/UDP/ICMP → app hint)
-    ├── packet_table_model.*   # QAbstractTableModel: batched inserts, index-based sorting
-    └── packet_types.h         # DissectedPacket, LayerInfo
+    ├── sniffer_worker.*       # pcap live/offline loop on QThread + .pcap writer
+    ├── protocol_parser.*      # bounds-checked dissector (L2 → L3 → L4 → app summary)
+    ├── packet_table_model.*   # QAbstractTableModel: batched inserts, protocol row colours
+    ├── packet_filter_proxy.*  # QSortFilterProxyModel: live display filter & sorting
+    └── packet_types.h         # DissectedPacket, LayerInfo, PacketFields
 ```
 
 How a packet moves through it:
