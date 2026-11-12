@@ -8,14 +8,15 @@
 
 namespace Ui { class MainWindow; }
 class QLabel;
+class HexViewWidget;
+class PacketDetailsWidget;
+class PacketFilterProxyModel;
 class PacketTableModel;
 class SnifferWorker;
 
 /**
- * Main window. Owns the capture thread, the per-session worker and the packet
- * model. Packets flow worker -> model directly (queued connection); the
- * window only reacts to the model's row-insertion signals for auto-scroll and
- * the status bar.
+ * Main window. Owns the capture thread, the per-session worker, the packet
+ * model/proxy, and the detail/hex inspection panes.
  */
 class MainWindow : public QMainWindow
 {
@@ -31,6 +32,9 @@ protected:
 private slots:
     void onStartClicked();
     void onStopClicked();
+    void onOpenClicked();
+    void onSaveClicked();
+    void onCurrentRowChanged(const QModelIndex& current, const QModelIndex& previous);
 
     // Worker -> GUI (queued connections)
     void onCaptureStarted(int linkType);
@@ -38,7 +42,7 @@ private slots:
     void onCaptureStatistics(quint32 received, quint32 dropped);
     void onCaptureFinished();
 
-    // Model -> GUI
+    // Model/proxy -> GUI
     void onRowsAboutToBeInserted();
     void onRowsInserted();
 
@@ -47,6 +51,7 @@ private:
 
     void setupPacketView();
     void populateInterfaces();
+    void startWorker(const QString& sourceName, const QString& filter, bool offline);
     void setState(State state);
     void updateStatusLabels();
     void shutdownCapture();
@@ -54,7 +59,10 @@ private:
 
     std::unique_ptr<Ui::MainWindow> ui;
 
-    PacketTableModel* m_model = nullptr;   // owned by this (QObject parent)
+    PacketTableModel*       m_model         = nullptr;   // owned by this
+    PacketFilterProxyModel* m_proxy         = nullptr;   // owned by this
+    PacketDetailsWidget*    m_detailsWidget = nullptr;   // owned by this
+    HexViewWidget*          m_hexView       = nullptr;   // owned by this
 
     QThread        m_thread;
     SnifferWorker* m_worker = nullptr;
@@ -66,6 +74,8 @@ private:
     QString m_currentInterface;
     QString m_currentFilter;
     QString m_lastStatsText;
+    int     m_lastLinkType   = -1;
+    bool    m_offlineSession = false;
 
     /// Decided just before each insertion: should the view follow the tail?
     bool m_followTail = true;

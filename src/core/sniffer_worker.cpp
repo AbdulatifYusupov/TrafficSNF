@@ -9,10 +9,11 @@
 
 #include "core/protocol_parser.h"
 
-SnifferWorker::SnifferWorker(QString deviceName, QString captureFilter, QObject* parent)
+SnifferWorker::SnifferWorker(QString sourceName, QString captureFilter, bool offlineMode, QObject* parent)
     : QObject(parent)
-    , m_deviceName(std::move(deviceName))
+    , m_deviceName(std::move(sourceName))
     , m_filter(captureFilter.trimmed())
+    , m_offline(offlineMode)
 {
 }
 
@@ -54,9 +55,6 @@ QList<NetworkDevice> SnifferWorker::listDevices(QString* errorOut)
     return result;
 }
 
-// ---------------------------------------------------------------------------
-// BPF filter validation (GUI thread, only while no capture is running)
-// ---------------------------------------------------------------------------
 bool SnifferWorker::validateFilter(const QString& filter, QString* errorOut)
 {
     if (filter.trimmed().isEmpty())
@@ -82,9 +80,51 @@ bool SnifferWorker::validateFilter(const QString& filter, QString* errorOut)
     return ok;
 }
 
-// ---------------------------------------------------------------------------
-// Stop request (called from the GUI thread)
-// ---------------------------------------------------------------------------
+bool SnifferWorker::savePcap(const QString& filePath,
+                             int linkType,
+                             const QList<DissectedPacket>& packets,
+                             QString* errorOut)
+{
+    const int dlt = (linkType >= 0) ? linkType : DLT_EN10MB;
+    pcap_t* dead = pcap_open_dead(dlt, kSnapLen);
+    if (!dead) {
+        if (errorOut)
+            *errorOut = QStringLiteral("pcap_open_dead failed");
+        return false;
+    }
+
+    const QByteArray pathBytes = filePath.toLocal8Bit();
+    pcap_dumper_t* dumper = pcap_dump_open(dead, pathBytes.constData());
+    if (!dumper) {
+        if (errorOut)
+            *errorOut = QString::fromLocal8Bit(pcap_geterr(dead));
+        pcap_close(dead);
+        return false;
+    }
+
+    for (const DissectedPacket& pkt : packets) {
+        pcap_pkthdr hdr{};
+        hdr.ts.tv_sec  = static_cast<decltype(hdr.ts.tv_sec)>(pkt.timestampUs / 1000000);
+        hdr.ts.tv_usec = static_cast<decltype(hdr.ts.tv_usec)>(pkt.timestampUs % 1000000);
+        hdr.caplen     = static_cast<bpf_u_int32>(pkt.data.size());
+        hdr.len        = static_cast<bpf_u_int32>(pkt.wireLength);
+        pcap_dump(reinterpret_cast<unsigned char*>(dumper), &hdr,
+                  reinterpret_cast<const unsigned char*>(pkt.data.constData()));
+    }
+
+    if (pcap_dump_flush(dumper) != 0) {
+        if (errorOut)
+            *errorOut = QString::fromLocal8Bit(pcap_geterr(dead));
+        pcap_dump_close(dumper);
+        pcap_close(dead);
+        return false;
+    }
+
+    pcap_dump_close(dumper);
+    pcap_close(dead);
+    return true;
+}
+
 void SnifferWorker::requestStop()
 {
     // Flag first: covers "not opened yet" and is the fallback if breakloop
@@ -97,9 +137,6 @@ void SnifferWorker::requestStop()
         pcap_breakloop(m_handle);
 }
 
-// ---------------------------------------------------------------------------
-// Capture loop (runs on the worker thread)
-// ---------------------------------------------------------------------------
 void SnifferWorker::run()
 {
     if (m_stopRequested.load()) {
@@ -110,11 +147,13 @@ void SnifferWorker::run()
     char errbuf[PCAP_ERRBUF_SIZE] = {};
     const QByteArray deviceBytes = m_deviceName.toLocal8Bit();
 
-    pcap_t* handle = pcap_open_live(deviceBytes.constData(),
-                                    kSnapLen,
-                                    kPromiscuous,
-                                    kReadTimeoutMs,
-                                    errbuf);
+    pcap_t* handle = m_offline
+                         ? pcap_open_offline(deviceBytes.constData(), errbuf)
+                         : pcap_open_live(deviceBytes.constData(),
+                                          kSnapLen,
+                                          kPromiscuous,
+                                          kReadTimeoutMs,
+                                          errbuf);
     if (!handle) {
         emit captureError(tr("Cannot open '%1': %2")
                               .arg(m_deviceName, QString::fromLocal8Bit(errbuf)));
@@ -170,6 +209,9 @@ void SnifferWorker::run()
         if (rc == PCAP_ERROR_BREAK)
             break;
 
+        if (m_offline && rc == 0)
+            break;
+
         if (rc < 0) {
             emit captureError(tr("Capture failed: %1")
                                   .arg(QString::fromLocal8Bit(pcap_geterr(handle))));
@@ -182,9 +224,11 @@ void SnifferWorker::run()
 
     flushBatch();   // deliver the tail so no packets are lost on stop
 
-    pcap_stat stats{};
-    if (pcap_stats(handle, &stats) == 0)
-        emit captureStatistics(stats.ps_recv, stats.ps_drop);
+    if (!m_offline) {
+        pcap_stat stats{};
+        if (pcap_stats(handle, &stats) == 0)
+            emit captureStatistics(stats.ps_recv, stats.ps_drop);
+    }
 
     {
         QMutexLocker lock(&m_handleMutex);
@@ -195,9 +239,6 @@ void SnifferWorker::run()
     emit finished();
 }
 
-// ---------------------------------------------------------------------------
-// Per-packet path (hot)
-// ---------------------------------------------------------------------------
 void SnifferWorker::pcapCallback(unsigned char* user,
                                  const pcap_pkthdr* header,
                                  const unsigned char* bytes)
@@ -226,9 +267,6 @@ void SnifferWorker::handlePacket(const pcap_pkthdr* header, const unsigned char*
         flushBatch();
 }
 
-// ---------------------------------------------------------------------------
-// Double-buffer hand-off
-// ---------------------------------------------------------------------------
 void SnifferWorker::flushBatch()
 {
     m_sinceFlush.restart();

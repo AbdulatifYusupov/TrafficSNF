@@ -45,9 +45,11 @@ public:
     static constexpr int kFlushIntervalMs = 40;
     static constexpr int kBatchReserve    = 1024;
 
+    /// sourceName is either a pcap device name or (when offlineMode is true) a .pcap file path.
     /// captureFilter is a BPF expression ("tcp port 443"); empty = capture everything.
-    explicit SnifferWorker(QString deviceName,
+    explicit SnifferWorker(QString sourceName,
                            QString captureFilter = QString(),
+                           bool offlineMode = false,
                            QObject* parent = nullptr);
     ~SnifferWorker() override;
 
@@ -57,6 +59,12 @@ public:
     /// feedback. The authoritative check still happens in run() on the real
     /// device, because a few filters depend on the link type.
     static bool validateFilter(const QString& filter, QString* errorOut = nullptr);
+
+    /// Write packets to a standard .pcap file. Returns false and populates errorOut on failure.
+    static bool savePcap(const QString& filePath,
+                         int linkType,
+                         const QList<DissectedPacket>& packets,
+                         QString* errorOut = nullptr);
 
     /// Thread-safe. Returns immediately; completion is signalled via finished().
     void requestStop();
@@ -81,6 +89,7 @@ private:
 
     const QString m_deviceName;
     const QString m_filter;
+    const bool    m_offline = false;
 
     // Cross-thread control state.
     std::atomic<bool> m_stopRequested{false};

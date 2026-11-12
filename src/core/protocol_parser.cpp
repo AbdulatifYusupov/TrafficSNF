@@ -270,6 +270,141 @@ bool looksLikeTls(const uchar* d, int len)
     return be16(d + 3) <= 18432;
 }
 
+const char* dnsTypeName(quint16 qtype)
+{
+    switch (qtype) {
+    case 1:   return "A";
+    case 2:   return "NS";
+    case 5:   return "CNAME";
+    case 6:   return "SOA";
+    case 12:  return "PTR";
+    case 15:  return "MX";
+    case 16:  return "TXT";
+    case 28:  return "AAAA";
+    case 33:  return "SRV";
+    case 64:  return "SVCB";
+    case 65:  return "HTTPS";
+    case 255: return "ANY";
+    default:  return nullptr;
+    }
+}
+
+/// Bounds-checked DNS QNAME decoder (handles RFC 1035 compression pointers
+/// with a strict hop limit so malformed packets cannot loop).
+QString decodeDnsName(const Ctx& c, int dnsOff, int nameOff, int* afterNameOff)
+{
+    QString out;
+    int pos = nameOff;
+    bool jumped = false;
+    int endPos = nameOff;
+
+    for (int guard = 0; guard < 64; ++guard) {
+        if (!c.has(pos, 1))
+            return {};
+        const quint8 len = c.at(pos)[0];
+        if (len == 0) {
+            if (!jumped)
+                endPos = pos + 1;
+            if (afterNameOff)
+                *afterNameOff = endPos;
+            return out.isEmpty() ? QStringLiteral("<root>") : out;
+        }
+        if ((len & 0xC0) == 0xC0) {
+            if (!c.has(pos, 2))
+                return {};
+            const int ptr = ((len & 0x3F) << 8) | c.at(pos)[1];
+            if (!jumped)
+                endPos = pos + 2;
+            jumped = true;
+            const int target = dnsOff + ptr;
+            if (target < dnsOff || target >= c.size)
+                return {};
+            pos = target;
+            continue;
+        }
+        if ((len & 0xC0) != 0)
+            return {};
+        if (!c.has(pos + 1, len))
+            return {};
+
+        if (!out.isEmpty())
+            out += QLatin1Char('.');
+        for (int i = 0; i < len; ++i) {
+            const uchar ch = c.at(pos + 1 + i)[0];
+            out += (ch >= 32 && ch < 127) ? QLatin1Char(static_cast<char>(ch)) : QLatin1Char('?');
+        }
+        pos += 1 + len;
+    }
+    return {};
+}
+
+QString formatDnsInfo(const Ctx& c, int dnsOff, int len)
+{
+    if (len < 12 || !c.has(dnsOff, 12))
+        return {};
+
+    const uchar* d = c.at(dnsOff);
+    const quint16 txId    = be16(d);
+    const quint16 flags   = be16(d + 2);
+    const quint16 qdCount = be16(d + 4);
+    const quint16 anCount = be16(d + 6);
+    const bool    isResp  = (flags & 0x8000) != 0;
+    const quint8  rcode   = flags & 0x000F;
+
+    QString summary = QStringLiteral("Standard query%1 0x%2")
+                          .arg(isResp ? QStringLiteral(" response") : QString())
+                          .arg(txId, 4, 16, QLatin1Char('0'));
+
+    if (qdCount > 0) {
+        int afterName = 0;
+        const QString qname = decodeDnsName(c, dnsOff, dnsOff + 12, &afterName);
+        if (!qname.isEmpty() && c.has(afterName, 4)) {
+            const quint16 qtype = be16(c.at(afterName));
+            const char* tname = dnsTypeName(qtype);
+            summary += tname ? QStringLiteral(" %1 %2").arg(QString::fromLatin1(tname), qname)
+                             : QStringLiteral(" TYPE%1 %2").arg(qtype).arg(qname);
+        }
+    }
+    if (isResp) {
+        if (rcode == 3)
+            summary += QStringLiteral(" (NXDOMAIN)");
+        else if (rcode != 0)
+            summary += QStringLiteral(" (rcode=%1)").arg(rcode);
+        else if (anCount > 0)
+            summary += QStringLiteral(" (%1 ans)").arg(anCount);
+    }
+    return summary;
+}
+
+QString formatHttpFirstLine(const uchar* d, int len)
+{
+    if (len < 4)
+        return {};
+
+    static const char* const kPrefixes[] = {
+        "GET ", "POST ", "PUT ", "DELETE ", "HEAD ", "OPTIONS ", "PATCH ", "CONNECT ", "HTTP/1."
+    };
+    bool matched = false;
+    for (const char* p : kPrefixes) {
+        const int plen = static_cast<int>(std::strlen(p));
+        if (len >= plen && std::memcmp(d, p, plen) == 0) {
+            matched = true;
+            break;
+        }
+    }
+    if (!matched)
+        return {};
+
+    const int maxScan = qMin(len, 120);
+    int eol = 0;
+    while (eol < maxScan && d[eol] != '\r' && d[eol] != '\n') {
+        if (d[eol] < 32 || d[eol] > 126)
+            return {};
+        ++eol;
+    }
+    return eol > 0 ? QString::fromLatin1(reinterpret_cast<const char*>(d), eol) : QString();
+}
+
 // ===========================================================================
 // Layer 4
 // ===========================================================================
@@ -342,6 +477,20 @@ void parseTcp(Ctx& c, const L3& l3, int off)
     info += QStringLiteral(" Win=%1 Len=%2").arg(f.window).arg(f.payloadLength);
     if (tls)
         info += QStringLiteral(" (TLS %1)").arg(QString::fromLatin1(tlsRecordName(*c.at(payloadOff))));
+    else if (capturedPayload > 0) {
+        if (p.protocol == QLatin1String("HTTP") || p.protocol == QLatin1String("HTTP-Alt")) {
+            const QString httpLine = formatHttpFirstLine(c.at(payloadOff), capturedPayload);
+            if (!httpLine.isEmpty())
+                info = QStringLiteral("%1 (%2)").arg(httpLine, info);
+        } else if (p.protocol == QLatin1String("DNS") && capturedPayload >= 14) {
+            const quint16 dnsLen = be16(c.at(payloadOff));
+            if (dnsLen >= 12) {
+                const QString dnsSummary = formatDnsInfo(c, payloadOff + 2, qMin(int(dnsLen), capturedPayload - 2));
+                if (!dnsSummary.isEmpty())
+                    info = dnsSummary;
+            }
+        }
+    }
     p.info = info;
 }
 
@@ -377,6 +526,16 @@ void parseUdp(Ctx& c, const L3& l3, int off)
     quint16 svcPort = 0;
     if (const char* svc = findService(f.srcPort, f.dstPort, IpProto::kUdp, &svcPort))
         p.protocol = QString::fromLatin1(svc);
+
+    const int payloadOff = off + 8;
+    const int capturedPayload = qMax(0, qMin(static_cast<int>(f.payloadLength), c.size - payloadOff));
+    if (capturedPayload > 0 && (p.protocol == QLatin1String("DNS") || p.protocol == QLatin1String("mDNS"))) {
+        const QString dnsSummary = formatDnsInfo(c, payloadOff, capturedPayload);
+        if (!dnsSummary.isEmpty()) {
+            p.info = dnsSummary;
+            return;
+        }
+    }
 
     p.info = QStringLiteral("%1 \u2192 %2 Len=%3").arg(f.srcPort).arg(f.dstPort).arg(f.payloadLength);
 }
@@ -467,6 +626,10 @@ void parseIpv4(Ctx& c, int off)
     }
 
     const quint16 totalLen = be16(ip + 2);
+    if (totalLen > 0 && totalLen < ihl) {
+        p.info = QStringLiteral("[Malformed IPv4 header]");
+        return;
+    }
     const quint16 fragField = be16(ip + 6);
     const int     fragOff = (fragField & 0x1FFF) * 8;
     const quint8  proto = ip[9];
@@ -744,6 +907,46 @@ void parseLoopback(Ctx& c)
     parseIpByVersion(c, 4);
 }
 
+/// DLT_LINUX_SLL (113): 16-byte Linux cooked capture v1 header (used on "any").
+void parseLinuxSll(Ctx& c)
+{
+    DissectedPacket& p = c.pkt;
+    p.protocol = QStringLiteral("Linux SLL");
+    if (!c.has(0, 16)) {
+        p.info = QStringLiteral("[Truncated Linux SLL header]");
+        return;
+    }
+    const uchar* s = c.at(0);
+    const quint16 addrLen = be16(s + 4);
+    const quint16 proto   = be16(s + 14);
+    if (addrLen == 6) {
+        std::memcpy(p.fields.srcMac.data(), s + 6, 6);
+        p.source = macStr(s + 6);
+    }
+    p.layers.append(LayerInfo{LayerType::LinuxSll, 0, 16});
+    parseNetwork(c, proto, 16);
+}
+
+/// DLT_LINUX_SLL2 (276): 20-byte Linux cooked capture v2 header.
+void parseLinuxSll2(Ctx& c)
+{
+    DissectedPacket& p = c.pkt;
+    p.protocol = QStringLiteral("Linux SLL2");
+    if (!c.has(0, 20)) {
+        p.info = QStringLiteral("[Truncated Linux SLL2 header]");
+        return;
+    }
+    const uchar* s = c.at(0);
+    const quint16 proto   = be16(s);
+    const quint8  addrLen = s[11];
+    if (addrLen == 6) {
+        std::memcpy(p.fields.srcMac.data(), s + 12, 6);
+        p.source = macStr(s + 12);
+    }
+    p.layers.append(LayerInfo{LayerType::LinuxSll, 0, 20});
+    parseNetwork(c, proto, 20);
+}
+
 } // namespace
 
 // ===========================================================================
@@ -774,6 +977,12 @@ DissectedPacket ProtocolParser::dissect(RawPacket raw, int linkType, qint64 firs
         break;
     case DLT_RAW:
         parseIpByVersion(ctx, 0);
+        break;
+    case 113: // DLT_LINUX_SLL
+        parseLinuxSll(ctx);
+        break;
+    case 276: // DLT_LINUX_SLL2
+        parseLinuxSll2(ctx);
         break;
     default:
         pkt.info = QStringLiteral("Unsupported link type %1").arg(linkType);

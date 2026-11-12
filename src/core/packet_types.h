@@ -57,6 +57,7 @@ Q_DECLARE_METATYPE(RawPacket)
 // ---------------------------------------------------------------------------
 enum class LayerType : quint8 {
     Loopback,   ///< 4-byte BSD loopback / Npcap loopback pseudo-header
+    LinuxSll,   ///< Linux cooked-mode capture v1/v2 ("any" pseudo-interface)
     Ethernet,   ///< Ethernet II including any 802.1Q / 802.1ad VLAN tags
     ARP,
     IPv4,
@@ -72,6 +73,7 @@ inline const char* layerTypeName(LayerType t)
 {
     switch (t) {
     case LayerType::Loopback: return "Loopback";
+    case LayerType::LinuxSll: return "Linux Cooked Capture";
     case LayerType::Ethernet: return "Ethernet";
     case LayerType::ARP:      return "ARP";
     case LayerType::IPv4:     return "IPv4";

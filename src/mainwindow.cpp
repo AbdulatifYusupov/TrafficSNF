@@ -1,10 +1,15 @@
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
 
+#include "core/packet_filter_proxy.h"
 #include "core/packet_table_model.h"
 #include "core/sniffer_worker.h"
+#include "hex_view_widget.h"
+#include "packet_details_widget.h"
 
 #include <QCloseEvent>
+#include <QFileDialog>
+#include <QFileInfo>
 #include <QHeaderView>
 #include <QItemSelectionModel>
 #include <QLabel>
@@ -12,22 +17,23 @@
 #include <QMessageBox>
 #include <QScrollBar>
 #include <QShortcut>
+#include <QSplitter>
 #include <QStatusBar>
 #include <QTableView>
 
-// ---------------------------------------------------------------------------
-// Construction / destruction
-// ---------------------------------------------------------------------------
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
     , ui(std::make_unique<Ui::MainWindow>())
 {
     ui->setupUi(this);
 
-    m_model = new PacketTableModel(this);
+    m_model         = new PacketTableModel(this);
+    m_proxy         = new PacketFilterProxyModel(m_model, this);
+    m_detailsWidget = new PacketDetailsWidget(this);
+    m_hexView       = new HexViewWidget(this);
+
     setupPacketView();
 
-    // --- Status bar: two permanent labels (interface, packet count) ---
     m_labelInterface = new QLabel(this);
     m_labelCount     = new QLabel(this);
     statusBar()->addPermanentWidget(m_labelInterface);
@@ -35,8 +41,9 @@ MainWindow::MainWindow(QWidget* parent)
 
     connect(ui->btnStart, &QPushButton::clicked, this, &MainWindow::onStartClicked);
     connect(ui->btnStop,  &QPushButton::clicked, this, &MainWindow::onStopClicked);
+    connect(ui->btnOpen,  &QPushButton::clicked, this, &MainWindow::onOpenClicked);
+    connect(ui->btnSave,  &QPushButton::clicked, this, &MainWindow::onSaveClicked);
 
-    // BPF filter box: live syntax check (red border + error tooltip), Enter starts.
     connect(ui->lineFilter, &QLineEdit::textChanged, this, [this](const QString& text) {
         QString error;
         const bool ok = SnifferWorker::validateFilter(text, &error);
@@ -46,21 +53,38 @@ MainWindow::MainWindow(QWidget* parent)
     });
     connect(ui->lineFilter, &QLineEdit::returnPressed, ui->btnStart, &QPushButton::click);
 
-    // Auto-scroll bookkeeping: decide BEFORE the rows arrive (scrollbar still
-    // reflects what the user is looking at), act AFTER the view has relaid out.
-    connect(m_model, &QAbstractItemModel::rowsAboutToBeInserted,
+    connect(ui->lineDisplayFilter, &QLineEdit::textChanged, this, [this](const QString& text) {
+        m_proxy->setFilterText(text);
+        const bool ok = m_proxy->isFilterValid();
+        ui->lineDisplayFilter->setStyleSheet(
+            ok ? QString() : QStringLiteral("QLineEdit { border: 1px solid #d9534f; }"));
+        ui->lineDisplayFilter->setToolTip(ok ? QString() : m_proxy->filterError());
+        updateStatusLabels();
+    });
+
+    connect(m_proxy, &QAbstractItemModel::rowsAboutToBeInserted,
             this, &MainWindow::onRowsAboutToBeInserted);
-    connect(m_model, &QAbstractItemModel::rowsInserted,
+    connect(m_proxy, &QAbstractItemModel::rowsInserted,
             this, &MainWindow::onRowsInserted);
+    connect(m_model, &QAbstractItemModel::rowsInserted,
+            this, &MainWindow::updateStatusLabels);
     connect(m_model, &QAbstractItemModel::modelReset,
             this, &MainWindow::updateStatusLabels);
 
-    // Ctrl+End: deselect and jump to the newest packet, which resumes auto-scroll.
+    connect(ui->tablePackets->selectionModel(), &QItemSelectionModel::currentRowChanged,
+            this, &MainWindow::onCurrentRowChanged);
+    connect(m_detailsWidget, &PacketDetailsWidget::byteRangeSelected,
+            m_hexView, &HexViewWidget::highlightRange);
+
     auto* followShortcut = new QShortcut(QKeySequence(Qt::CTRL | Qt::Key_End), this);
     connect(followShortcut, &QShortcut::activated, this, [this] {
         ui->tablePackets->clearSelection();
         ui->tablePackets->scrollToBottom();
     });
+    auto* openShortcut = new QShortcut(QKeySequence::Open, this);
+    connect(openShortcut, &QShortcut::activated, ui->btnOpen, &QPushButton::click);
+    auto* saveShortcut = new QShortcut(QKeySequence::Save, this);
+    connect(saveShortcut, &QShortcut::activated, ui->btnSave, &QPushButton::click);
 
     populateInterfaces();
     setState(State::Idle);
@@ -69,7 +93,7 @@ MainWindow::MainWindow(QWidget* parent)
 
 MainWindow::~MainWindow()
 {
-    shutdownCapture();   // idempotent; closeEvent normally did it already
+    shutdownCapture();
 }
 
 void MainWindow::closeEvent(QCloseEvent* event)
@@ -78,13 +102,10 @@ void MainWindow::closeEvent(QCloseEvent* event)
     QMainWindow::closeEvent(event);
 }
 
-// ---------------------------------------------------------------------------
-// Packet view configuration
-// ---------------------------------------------------------------------------
 void MainWindow::setupPacketView()
 {
     QTableView* view = ui->tablePackets;
-    view->setModel(m_model);
+    view->setModel(m_proxy);
 
     view->setSelectionBehavior(QAbstractItemView::SelectRows);
     view->setSelectionMode(QAbstractItemView::SingleSelection);
@@ -113,17 +134,28 @@ void MainWindow::setupPacketView()
     view->setColumnWidth(PacketTableModel::ColProtocol,    90);
     view->setColumnWidth(PacketTableModel::ColLength,      70);
 
-    // Header sorting. The indicator is set to "No. ascending" (the natural
-    // arrival order) BEFORE enabling sorting, so the view's initial sort is a
-    // no-op instead of some arbitrary default. Clicks are only enabled while
-    // idle, see setState().
+    // Header sorting. Set indicator to "No. ascending" before enabling sorting
+    // so the initial sort is a no-op.
     hh->setSortIndicator(PacketTableModel::ColNo, Qt::AscendingOrder);
     view->setSortingEnabled(true);
+
+    // Split window into packet table (top) and details + hex dump (bottom).
+    auto* bottomSplitter = new QSplitter(Qt::Horizontal, this);
+    bottomSplitter->addWidget(m_detailsWidget);
+    bottomSplitter->addWidget(m_hexView);
+    bottomSplitter->setStretchFactor(0, 1);
+    bottomSplitter->setStretchFactor(1, 1);
+
+    auto* mainSplitter = new QSplitter(Qt::Vertical, this);
+    ui->verticalLayout->removeWidget(view);
+    mainSplitter->addWidget(view);
+    mainSplitter->addWidget(bottomSplitter);
+    mainSplitter->setStretchFactor(0, 3);
+    mainSplitter->setStretchFactor(1, 2);
+
+    ui->verticalLayout->addWidget(mainSplitter, 1);
 }
 
-// ---------------------------------------------------------------------------
-// Interface list
-// ---------------------------------------------------------------------------
 void MainWindow::populateInterfaces()
 {
     QString error;
@@ -144,61 +176,64 @@ void MainWindow::populateInterfaces()
     }
 }
 
-// ---------------------------------------------------------------------------
-// UI state machine
-// ---------------------------------------------------------------------------
 void MainWindow::setState(State state)
 {
     m_state = state;
+    const bool idle        = (state == State::Idle);
     const bool haveDevices = ui->comboInterfaces->count() > 0;
+    const bool havePackets = m_model->packetCount() > 0;
 
-    ui->comboInterfaces->setEnabled(state == State::Idle && haveDevices);
-    ui->lineFilter->setEnabled(state == State::Idle);
-    ui->btnStart->setEnabled(state == State::Idle && haveDevices);
+    ui->comboInterfaces->setEnabled(idle && haveDevices);
+    ui->lineFilter->setEnabled(idle);
+    ui->btnStart->setEnabled(idle && haveDevices);
     ui->btnStop->setEnabled(state == State::Running);
+    ui->btnOpen->setEnabled(idle);
+    ui->btnSave->setEnabled(idle && havePackets);
 
-    // Re-sorting reorders the entire store, which makes no sense while rows
-    // are still being appended, so header clicks only work when stopped.
-    ui->tablePackets->horizontalHeader()->setSectionsClickable(state == State::Idle);
+    // Re-sorting reorders rows while new ones arrive, so allow clicks only when idle.
+    ui->tablePackets->horizontalHeader()->setSectionsClickable(idle);
 }
 
 void MainWindow::updateStatusLabels()
 {
-    m_labelInterface->setText(tr("Interface: %1")
+    m_labelInterface->setText(tr("Source: %1")
                                   .arg(m_currentInterface.isEmpty() ? QStringLiteral("\u2014") : m_currentInterface));
-    m_labelCount->setText(tr("Packets: %1").arg(m_model->packetCount()));
+
+    const int total   = m_model->packetCount();
+    const int visible = m_proxy->rowCount();
+    if (!m_proxy->filterText().isEmpty())
+        m_labelCount->setText(tr("Packets: %1 / %2").arg(visible).arg(total));
+    else
+        m_labelCount->setText(tr("Packets: %1").arg(total));
+
+    if (m_state == State::Idle)
+        ui->btnSave->setEnabled(total > 0);
 }
 
-// ---------------------------------------------------------------------------
-// Start / stop
-// ---------------------------------------------------------------------------
-void MainWindow::onStartClicked()
+void MainWindow::startWorker(const QString& sourceName, const QString& filter, bool offline)
 {
-    if (m_state != State::Idle || ui->comboInterfaces->count() == 0)
+    if (m_state != State::Idle)
         return;
 
-    const QString device = ui->comboInterfaces->currentData().toString();
-
-    // Fresh session: empty model first, then put the sort indicator back on
-    // "No. ascending" (the model is empty, so the resulting sort is free).
     m_model->clear();
+    m_detailsWidget->clearDetails();
+    m_hexView->clearData();
     ui->tablePackets->horizontalHeader()->setSortIndicator(PacketTableModel::ColNo,
                                                            Qt::AscendingOrder);
-    m_followTail = true;
-    m_lastStatsText.clear();
-    m_currentInterface = device;
-    m_currentFilter    = ui->lineFilter->text().trimmed();
 
-    m_worker = new SnifferWorker(device, m_currentFilter);   // no parent: it will move threads
+    m_followTail     = !offline;
+    m_offlineSession = offline;
+    m_lastLinkType   = -1;
+    m_lastStatsText.clear();
+    m_currentInterface = offline ? QFileInfo(sourceName).fileName() : sourceName;
+    m_currentFilter    = filter;
+
+    m_worker = new SnifferWorker(sourceName, filter, offline);   // no parent: moves threads
     m_worker->moveToThread(&m_thread);
 
-    // QUEUED on purpose: run() must execute from inside the thread's event
-    // loop, otherwise a quit() issued before exec() is entered gets lost.
+    // QUEUED on purpose: run() must execute from inside the thread's event loop.
     connect(&m_thread, &QThread::started, m_worker, &SnifferWorker::run, Qt::QueuedConnection);
 
-    // Worker -> model. The worker emits from its own thread and the model
-    // lives here, so this is queued: batches are marshalled through the GUI
-    // event loop, with no locks and no blocking of the capture thread.
     connect(m_worker, &SnifferWorker::packetsReady,
             m_model, &PacketTableModel::appendPackets, Qt::QueuedConnection);
 
@@ -207,15 +242,25 @@ void MainWindow::onStartClicked()
     connect(m_worker, &SnifferWorker::captureStatistics, this, &MainWindow::onCaptureStatistics);
     connect(m_worker, &SnifferWorker::finished,          this, &MainWindow::onCaptureFinished);
 
-    // Direct: QThread::quit() is thread-safe, and calling it from the worker
-    // thread lets the thread wind down even if the GUI thread is blocked in wait().
+    // Direct: QThread::quit() is thread-safe, avoiding races when wait() runs.
     connect(m_worker, &SnifferWorker::finished, &m_thread, &QThread::quit, Qt::DirectConnection);
 
     setState(State::Running);
     updateStatusLabels();
-    statusBar()->showMessage(tr("Opening %1\u2026").arg(device));
+    statusBar()->showMessage(offline ? tr("Loading %1\u2026").arg(m_currentInterface)
+                                     : tr("Opening %1\u2026").arg(sourceName));
 
     m_thread.start();
+}
+
+void MainWindow::onStartClicked()
+{
+    if (m_state != State::Idle || ui->comboInterfaces->count() == 0)
+        return;
+
+    const QString device = ui->comboInterfaces->currentData().toString();
+    const QString filter = ui->lineFilter->text().trimmed();
+    startWorker(device, filter, /*offline=*/false);
 }
 
 void MainWindow::onStopClicked()
@@ -228,13 +273,73 @@ void MainWindow::onStopClicked()
     m_worker->requestStop();
 }
 
-// ---------------------------------------------------------------------------
-// Worker callbacks
-// ---------------------------------------------------------------------------
+void MainWindow::onOpenClicked()
+{
+    if (m_state != State::Idle)
+        return;
+
+    const QString path = QFileDialog::getOpenFileName(
+        this,
+        tr("Open capture file"),
+        QString(),
+        tr("PCAP files (*.pcap *.cap);;All files (*)"));
+    if (path.isEmpty())
+        return;
+
+    startWorker(path, ui->lineFilter->text().trimmed(), /*offline=*/true);
+}
+
+void MainWindow::onSaveClicked()
+{
+    if (m_state != State::Idle || m_model->packetCount() == 0)
+        return;
+
+    const QString path = QFileDialog::getSaveFileName(
+        this,
+        tr("Save capture file"),
+        QStringLiteral("capture.pcap"),
+        tr("PCAP files (*.pcap);;All files (*)"));
+    if (path.isEmpty())
+        return;
+
+    QString error;
+    if (!SnifferWorker::savePcap(path, m_lastLinkType, m_model->packets(), &error)) {
+        QMessageBox::critical(this, tr("Save error"),
+                              tr("Failed to save '%1': %2").arg(path, error));
+        return;
+    }
+
+    statusBar()->showMessage(tr("Saved %1 packets to %2")
+                                 .arg(m_model->packetCount())
+                                 .arg(QFileInfo(path).fileName()));
+}
+
+void MainWindow::onCurrentRowChanged(const QModelIndex& current, const QModelIndex& /*previous*/)
+{
+    if (!current.isValid()) {
+        m_detailsWidget->clearDetails();
+        m_hexView->clearData();
+        return;
+    }
+
+    const QModelIndex src = m_proxy->mapToSource(current);
+    if (!src.isValid() || src.row() >= m_model->packetCount()) {
+        m_detailsWidget->clearDetails();
+        m_hexView->clearData();
+        return;
+    }
+
+    const DissectedPacket& pkt = m_model->packetAt(src.row());
+    m_detailsWidget->setPacket(pkt);
+    m_hexView->setData(pkt.data);
+}
+
 void MainWindow::onCaptureStarted(int linkType)
 {
-    QString msg = tr("Capturing on %1 (link type %2)")
-    .arg(m_currentInterface).arg(linkType);
+    m_lastLinkType = linkType;
+    QString msg = m_offlineSession
+                      ? tr("Reading %1 (link type %2)").arg(m_currentInterface).arg(linkType)
+                      : tr("Capturing on %1 (link type %2)").arg(m_currentInterface).arg(linkType);
     if (!m_currentFilter.isEmpty())
         msg += tr(", filter: %1").arg(m_currentFilter);
     statusBar()->showMessage(msg);
@@ -259,17 +364,21 @@ void MainWindow::onCaptureFinished()
     setState(State::Idle);
     updateStatusLabels();
 
-    QString msg = tr("Capture stopped \u2014 %1 packets").arg(m_model->packetCount());
+    QString msg = m_offlineSession
+                      ? tr("Loaded %1 packets from %2").arg(m_model->packetCount()).arg(m_currentInterface)
+                      : tr("Capture stopped \u2014 %1 packets").arg(m_model->packetCount());
     if (!m_lastStatsText.isEmpty())
         msg += QStringLiteral(" (%1)").arg(m_lastStatsText);
     statusBar()->showMessage(msg);
 }
 
-// ---------------------------------------------------------------------------
-// Auto-scroll
-// ---------------------------------------------------------------------------
 void MainWindow::onRowsAboutToBeInserted()
 {
+    if (m_offlineSession) {
+        m_followTail = false;
+        return;
+    }
+
     // Follow the tail only if the user is parked at the bottom AND has not
     // picked a row. Scrolling up or selecting a row both pin the view.
     QTableView* view = ui->tablePackets;
@@ -285,9 +394,6 @@ void MainWindow::onRowsInserted()
         ui->tablePackets->scrollToBottom();
 }
 
-// ---------------------------------------------------------------------------
-// Teardown helpers
-// ---------------------------------------------------------------------------
 void MainWindow::joinAndDeleteWorker()
 {
     // Re-issuing quit() each round makes the join immune to a quit() that

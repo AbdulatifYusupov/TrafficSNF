@@ -1,9 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
-project(TrafficSNF VERSION 0.1.0 LANGUAGES CXX)
+project(TrafficSNF VERSION 2.0 LANGUAGES CXX)
 
-# ---------------------------------------------------------------------------
-# Настройки C++ и Qt генераторов
-# ---------------------------------------------------------------------------
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -14,14 +11,8 @@ set(CMAKE_AUTORCC ON)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# ---------------------------------------------------------------------------
-# Поиск Qt 6
-# ---------------------------------------------------------------------------
 find_package(Qt6 6.2 REQUIRED COMPONENTS Core Gui Widgets)
 
-# ---------------------------------------------------------------------------
-# Поиск Npcap / libpcap (с автопоиском в типичных путях на Windows)
-# ---------------------------------------------------------------------------
 find_path(PCAP_INCLUDE_DIR
     NAMES pcap.h pcap/pcap.h
     HINTS 
@@ -49,10 +40,10 @@ find_package_handle_standard_args(PCAP
 
 if(NOT PCAP_FOUND)
     message(FATAL_ERROR
-        "Npcap SDK / libpcap не найден!\n"
-        "1. Скачай Npcap SDK (zip) с https://npcap.com/#download\n"
-        "2. Распакуй, например, в 'C:/npcap-sdk'\n"
-        "3. Или передай путь через CMake: -DPCAP_ROOT=C:/твой/путь/к/sdk"
+        "Npcap SDK / libpcap not found!\n"
+        "1. Download Npcap SDK (zip) from https://npcap.com/#download\n"
+        "2. Unpack it, e.g. to 'C:/npcap-sdk'\n"
+        "3. Or pass the path to CMake: -DPCAP_ROOT=C:/path/to/sdk"
     )
 endif()
 
@@ -62,19 +53,22 @@ set_target_properties(pcap_imported PROPERTIES
     INTERFACE_INCLUDE_DIRECTORIES "${PCAP_INCLUDE_DIR}"
 )
 
-# ---------------------------------------------------------------------------
-# Таргет приложения
-# ---------------------------------------------------------------------------
 add_executable(TrafficSNF
     src/main.cpp
     src/mainwindow.h
     src/mainwindow.cpp
     src/mainwindow.ui
+    src/hex_view_widget.h
+    src/hex_view_widget.cpp
+    src/packet_details_widget.h
+    src/packet_details_widget.cpp
     src/core/packet_types.h
     src/core/protocol_parser.h
     src/core/protocol_parser.cpp
     src/core/packet_table_model.h
     src/core/packet_table_model.cpp
+    src/core/packet_filter_proxy.h
+    src/core/packet_filter_proxy.cpp
     src/core/sniffer_worker.h
     src/core/sniffer_worker.cpp
 )
@@ -92,7 +86,6 @@ target_link_libraries(TrafficSNF PRIVATE
 )
 
 if(WIN32)
-    # На Windows для работы с сокетами и пакетами линкуем ws2_32
     target_link_libraries(TrafficSNF PRIVATE ws2_32)
 endif()
 

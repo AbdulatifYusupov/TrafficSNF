@@ -48,6 +48,20 @@
         </property>
        </widget>
       </item>
+      <item>
+       <widget class="QPushButton" name="btnOpen">
+        <property name="text">
+         <string>Open .pcap</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QPushButton" name="btnSave">
+        <property name="text">
+         <string>Save .pcap</string>
+        </property>
+       </widget>
+      </item>
      </layout>
     </item>
     <item>
@@ -63,6 +77,27 @@
        <widget class="QLineEdit" name="lineFilter">
         <property name="placeholderText">
          <string>BPF expression, e.g.  tcp port 443   |   host 10.0.0.5 and not port 22</string>
+        </property>
+        <property name="clearButtonEnabled">
+         <bool>true</bool>
+        </property>
+       </widget>
+      </item>
+     </layout>
+    </item>
+    <item>
+     <layout class="QHBoxLayout" name="displayFilterLayout">
+      <item>
+       <widget class="QLabel" name="labelDisplayFilter">
+        <property name="text">
+         <string>Display filter:</string>
+        </property>
+       </widget>
+      </item>
+      <item>
+       <widget class="QLineEdit" name="lineDisplayFilter">
+        <property name="placeholderText">
+         <string>e.g.  dns  |  ip == 1.1.1.1  |  port == 443 and not tcp.rst</string>
         </property>
         <property name="clearButtonEnabled">
          <bool>true</bool>

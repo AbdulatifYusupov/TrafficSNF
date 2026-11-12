@@ -43,9 +43,10 @@ public:
                         int role = Qt::DisplayRole) const override;
     void sort(int column, Qt::SortOrder order = Qt::AscendingOrder) override;
 
-    // --- Accessors for the future detail / hex panes -------------------------
+    // --- Accessors for the detail / hex panes and pcap export --------------
     int packetCount() const { return static_cast<int>(m_packets.size()); }
     const DissectedPacket& packetAt(int row) const { return m_packets.at(row); }
+    const QList<DissectedPacket>& packets() const { return m_packets; }
 
 public slots:
     /// Appends a whole batch with a single beginInsertRows/endInsertRows pair.
